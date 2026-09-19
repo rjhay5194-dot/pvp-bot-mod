@@ -17,6 +17,7 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
@@ -25,8 +26,11 @@ import net.minecraft.tags.ItemTags;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.phys.AABB;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -66,10 +70,12 @@ import java.util.concurrent.ThreadLocalRandom;
  *   - hold their best sword (or axe) from the hotbar while fighting
  *   - chase with sprint + bunny hop, stop hopping when close
  *   - after each hit they stand still for a few ticks, then go again
- *   - sometimes jump for a critical hit when close
+ *   - sometimes jump for a critical hit when close, and always crit when they happen to be falling (fallcrit)
  *   - at low hearts they run away bunny hopping, eat, then fight again
  *   - revenge: they fight back against whoever hits them
- *   - auto target: idle bots pick the nearest player
+ *   - auto target: idle bots pick the nearest player (bots may pick other bots, see botfight)
+ *   - smooth aim (aim), random reaction time before each hit (reactmin/reactmax)
+ *   - strafe left/right while close (strafe), and use a water bucket to escape cobwebs (webescape)
  */
 public class PvpBotMod implements ModInitializer {
 
@@ -121,8 +127,8 @@ public class PvpBotMod implements ModInitializer {
         return o;
     }
 
-    private static final Opt ATTACK_RANGE = opt("range", "attack_range", 3.3, 1.0, 6.0, false,
-            "blocks within which bots attack");
+    private static final Opt ATTACK_RANGE = opt("range", "attack_range", 3.0, 1.0, 6.0, false,
+            "reach in blocks, measured from the bot's eyes to the target's hitbox");
     private static final Opt BUNNY_HOP = opt("bunnyhop", "bunny_hop", 1, 0, 1, true,
             "sprint-jump while chasing");
     private static final Opt HOP_STOP = opt("hopstop", "hop_stop_distance", 3.5, 1.0, 8.0, false,
@@ -134,18 +140,36 @@ public class PvpBotMod implements ModInitializer {
     private static final Opt EAT_HEARTS = opt("eat", "eat_below_hearts", 6.0, 0, 10, false,
             "bots run away and eat at this many hearts or fewer (0 = never)");
     private static final Opt EAT_COUNT = opt("eatcount", "eat_count", 3, 1, 10, false,
-            "items eaten before the bot fights again");
+            "items eaten in a row before the bot fights again (it runs away only once, then eats them all)");
     private static final Opt FLEE_DIST = opt("flee", "flee_distance", 8.0, 3.0, 30.0, false,
             "blocks to run away before eating");
     private static final Opt CRIT_CHANCE = opt("critchance", "crit_chance", 30, 0, 100, false,
             "percent chance to try a critical hit when close");
     private static final Opt CRIT_RANGE = opt("critrange", "crit_range", 4.0, 1.0, 6.0, false,
             "blocks within which bots try critical hits");
+    private static final Opt FALL_CRIT = opt("fallcrit", "fall_crit", 1, 0, 1, true,
+            "bots that are falling within reach always hit as a critical (ignores critchance/critrange)");
     private static final Opt AUTO_TARGET = opt("autotarget", "auto_target", 1, 0, 1, true,
             "idle bots pick the nearest player as their target");
     private static final Opt FIND_RANGE = opt("findrange", "find_range", 24, 4, 128, false,
             "blocks within which bots look for a target");
 
+    private static final Opt AIM = opt("aim", "aim_ticks", 2, 0, 20, false,
+            "ticks the bot takes to turn toward its target (0 = instant)");
+    private static final Opt REACT_MIN = opt("reactmin", "reaction_min_ticks", 2, 0, 40, false,
+            "shortest wait before the bot swings once a hit is possible");
+    private static final Opt REACT_MAX = opt("reactmax", "reaction_max_ticks", 6, 0, 40, false,
+            "longest wait before the bot swings once a hit is possible");
+    private static final Opt BOT_FIGHT = opt("botfight", "bots_fight_each_other", 1, 0, 1, true,
+            "bots can target and take revenge on other bots");
+    private static final Opt WEB_ESCAPE = opt("webescape", "web_escape", 1, 0, 1, true,
+            "bots stuck in a cobweb use a water bucket from their inventory to get out");
+    private static final Opt STRAFE = opt("strafe", "strafe", 1, 0, 1, true,
+            "bots strafe left and right while close to their target");
+    private static final Opt STRAFE_TICKS = opt("strafeticks", "strafe_ticks", 10, 2, 40, false,
+            "ticks between strafe direction changes");
+
+    private static final double STRAFE_MAX_DIST = 6.0;
     private static final double HOP_RESUME_MARGIN = 1.0;
     private static final int FLEE_MAX_TICKS = 80;
     private static final int EAT_TIMEOUT_TICKS = 60;
@@ -193,6 +217,16 @@ public class PvpBotMod implements ModInitializer {
         int useStart;
         int eaten;
         int nextEatTick;
+        int eatSlot;
+        int eatStackCount;
+        Item eatItem;
+        int reactAt = -1;
+        int sprintHoldUntil;
+        int strafeDir;
+        int nextStrafeTick;
+        int webStage;
+        int webStart;
+        int nextWebTick;
 
         Fight(String target) {
             this.target = target;
@@ -207,6 +241,9 @@ public class PvpBotMod implements ModInitializer {
             weaponSlot = -1;
             attackTick = -1;
             eaten = 0;
+            reactAt = -1;
+            strafeDir = 0;
+            webStage = 0;
         }
     }
 
@@ -318,10 +355,9 @@ public class PvpBotMod implements ModInitializer {
             return 0;
         }
 
-        String pos = String.format(Locale.ROOT, "%.2f %.2f %.2f", me.getX(), me.getY(), me.getZ());
         // Runs with the caller's own permissions and shows HeroBot's own messages, so any error is visible.
-        server.getCommands().performPrefixedCommand(src,
-                "playerspawn " + name + " at " + pos + " in survival");
+        // Plain /playerspawn spawns at the caller's position; the gamemode is switched once the bot is online.
+        server.getCommands().performPrefixedCommand(src, "playerspawn " + name);
 
         // HeroBot spawns bots asynchronously, so the bot may not exist yet. tickPending() finishes the job.
         PENDING.put(name, new Pending(me.getName().getString()));
@@ -643,6 +679,88 @@ public class PvpBotMod implements ModInitializer {
         }
     }
 
+    private static String lookCmd(String name, String target) {
+        int t = AIM.asInt();
+        return "player " + name + " look upon " + target + " eyes" + (t > 0 ? " delta " + t : "");
+    }
+
+    /** Distance from the bot's eyes to the nearest point of the target's hitbox (what melee reach is measured by). */
+    private static double reachDistance(ServerPlayer bot, ServerPlayer target) {
+        AABB box = target.getBoundingBox();
+        double ex = bot.getX();
+        double ey = bot.getEyeY();
+        double ez = bot.getZ();
+        double dx = Math.max(Math.max(box.minX - ex, 0.0), ex - box.maxX);
+        double dy = Math.max(Math.max(box.minY - ey, 0.0), ey - box.maxY);
+        double dz = Math.max(Math.max(box.minZ - ez, 0.0), ez - box.maxZ);
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    private static boolean inCobweb(ServerPlayer bot) {
+        BlockPos pos = bot.blockPosition();
+        return bot.level().getBlockState(pos).is(Blocks.COBWEB)
+                || bot.level().getBlockState(pos.above()).is(Blocks.COBWEB);
+    }
+
+    private static int findItemIndex(ServerPlayer bot, Item item) {
+        Inventory inv = bot.getInventory();
+        for (int i = 0; i < 36; i++) {
+            if (inv.getItem(i).is(item)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Cobweb escape: look down, pour the water bucket so the water breaks the web,
+     * then pick the water back up. Returns true while it is busy (the rest of the fight logic waits).
+     */
+    private static boolean webEscape(MinecraftServer server, String name, Fight f, ServerPlayer bot) {
+        if (f.webStage == 0) {
+            if (!WEB_ESCAPE.on() || globalTick < f.nextWebTick || !inCobweb(bot)) {
+                return false;
+            }
+            int idx = findItemIndex(bot, Items.WATER_BUCKET);
+            int slot = idx < 0 ? -1 : toHotbar(bot, idx, findWeaponSlot(bot));
+            if (slot < 0) {
+                f.nextWebTick = globalTick + 100; // no water bucket: don't check every tick
+                return false;
+            }
+            run(server, "player " + name + " stop");
+            run(server, "player " + name + " hotbar " + (slot + 1));
+            run(server, "player " + name + " look " + String.format(Locale.ROOT, "%.1f", bot.getYRot()) + " 90");
+            f.started = false;
+            f.hopping = false;
+            f.paused = false;
+            f.crit = false;
+            f.strafeDir = 0;
+            f.attackTick = -1;
+            f.webStage = 1;
+            f.webStart = globalTick;
+            return true;
+        }
+        if (f.webStage == 1) {
+            if (globalTick - f.webStart >= 2) {
+                run(server, "player " + name + " use once"); // pour the water
+                f.webStage = 2;
+                f.webStart = globalTick;
+            }
+        } else if (f.webStage == 2) {
+            if (globalTick - f.webStart >= 12) {
+                run(server, "player " + name + " use once"); // scoop the water back up
+                f.webStage = 3;
+                f.webStart = globalTick;
+            }
+        } else if (globalTick - f.webStart >= 6) {
+            f.webStage = 0;
+            f.nextWebTick = globalTick + 40;
+            f.started = false;
+            f.weaponSlot = -1; // back to the sword
+        }
+        return true;
+    }
+
     /** Can this player still be fought (online, alive, not a spectator, same dimension)? */
     private static boolean reachable(ServerPlayer bot, ServerPlayer t) {
         return t != null && t != bot && t.isAlive() && !t.isSpectator() && bot.level() == t.level();
@@ -684,6 +802,7 @@ public class PvpBotMod implements ModInitializer {
                 it.remove();
                 BOTS.add(name);
                 STOPPED.remove(name);
+                run(server, "gamemode survival " + name);
                 if (owner != null) {
                     owner.sendSystemMessage(Component.literal(
                             "Spawned " + name + ". Use /pvpbot fight " + name + " to start"
@@ -731,8 +850,8 @@ public class PvpBotMod implements ModInitializer {
             LAST_HURT.put(name, stamp);
 
             String attackerName = attacker.getName().getString();
-            if (BOTS.contains(attackerName)) {
-                continue; // bots never take revenge on each other
+            if (BOTS.contains(attackerName) && !BOT_FIGHT.on()) {
+                continue;
             }
             STOPPED.remove(name);
             Fight f = FIGHTS.get(name);
@@ -762,7 +881,8 @@ public class PvpBotMod implements ModInitializer {
             ServerPlayer best = null;
             double bestDist = FIND_RANGE.value;
             for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-                if (p == bot || BOTS.contains(p.getName().getString()) || p.isCreative() || !reachable(bot, p)) {
+                if (p == bot || (!BOT_FIGHT.on() && BOTS.contains(p.getName().getString()))
+                        || p.isCreative() || !reachable(bot, p)) {
                     continue;
                 }
                 double d = bot.distanceTo(p);
@@ -824,6 +944,11 @@ public class PvpBotMod implements ModInitializer {
 
     private static void fightPhase(MinecraftServer server, String name, Fight f,
                                    ServerPlayer bot, ServerPlayer target, double dist) {
+        // Stuck in a cobweb: use a water bucket to get out.
+        if (webEscape(server, name, f, bot)) {
+            return;
+        }
+
         // Low health: run away bunny hopping and eat.
         double hp = bot.getHealth() + bot.getAbsorptionAmount();
         if (EAT_HEARTS.value > 0 && hp <= EAT_HEARTS.value * 2.0 && globalTick >= f.nextEatTick
@@ -833,7 +958,7 @@ public class PvpBotMod implements ModInitializer {
         }
 
         if (globalTick % 2 == 0) {
-            run(server, "player " + name + " look upon " + f.target + " eyes");
+            run(server, lookCmd(name, f.target));
         }
 
         if (!f.started && !f.paused) {
@@ -863,6 +988,7 @@ public class PvpBotMod implements ModInitializer {
                     f.hopping = false;
                 }
                 f.started = false;
+                f.strafeDir = 0;
                 f.paused = true;
                 f.pauseUntil = globalTick + pause;
             }
@@ -885,21 +1011,39 @@ public class PvpBotMod implements ModInitializer {
             f.hopping = true;
         }
 
+        // Strafe: switch sides every few ticks while close. "move forward" is re-sent so the bot keeps closing in.
+        if (STRAFE.on() && !f.hopping && !f.crit && dist <= STRAFE_MAX_DIST) {
+            if (globalTick >= f.nextStrafeTick) {
+                f.strafeDir = f.strafeDir == 0
+                        ? (ThreadLocalRandom.current().nextBoolean() ? 1 : -1)
+                        : -f.strafeDir;
+                run(server, "player " + name + " move " + (f.strafeDir > 0 ? "left" : "right"));
+                run(server, "player " + name + " move forward");
+                int base = Math.max(2, STRAFE_TICKS.asInt());
+                f.nextStrafeTick = globalTick + base + ThreadLocalRandom.current().nextInt(base / 2 + 1);
+            }
+        } else if (f.strafeDir != 0) {
+            run(server, "player " + name + " move");
+            run(server, "player " + name + " move forward");
+            f.strafeDir = 0;
+        }
+
         // A sprint-hit cancels sprinting (that is what gives the extra knockback), so sprint again.
-        if (!f.crit && !bot.isSprinting()) {
+        if (!f.crit && globalTick >= f.sprintHoldUntil && !bot.isSprinting()) {
             run(server, "player " + name + " sprint");
         }
 
+        double reach = reachDistance(bot, target);
         boolean ready = bot.getAttackStrengthScale(0.5F) >= 1.0F;
 
         // Critical hit in progress: hit on the way down.
         if (f.crit) {
             boolean falling = !bot.onGround() && bot.getDeltaMovement().y < 0.0;
-            if (falling && dist <= ATTACK_RANGE.value && ready) {
+            if (falling && reach <= ATTACK_RANGE.value && ready) {
                 run(server, "player " + name + " attack once");
                 f.attackTick = globalTick;
                 f.crit = false;
-                run(server, "player " + name + " sprint");
+                f.sprintHoldUntil = globalTick + 3; // don't sprint again before the swing lands, or it won't crit
             } else if (globalTick - f.critStart > CRIT_TIMEOUT_TICKS) {
                 f.crit = false;
                 run(server, "player " + name + " sprint");
@@ -907,19 +1051,43 @@ public class PvpBotMod implements ModInitializer {
             return;
         }
 
-        if (ready) {
-            boolean tryCrit = CRIT_CHANCE.value > 0 && dist <= CRIT_RANGE.value && bot.onGround() && !f.hopping
-                    && ThreadLocalRandom.current().nextDouble() * 100.0 < CRIT_CHANCE.value;
-            if (tryCrit) {
-                // Crits need a falling, non-sprinting hit: stop sprinting and jump.
-                run(server, "player " + name + " unsprint");
-                run(server, "player " + name + " jump once");
-                f.crit = true;
-                f.critStart = globalTick;
-            } else if (dist <= ATTACK_RANGE.value) {
-                run(server, "player " + name + " attack once");
-                f.attackTick = globalTick;
+        // Falling crit: whenever the bot is on its way down within reach with a full cooldown, hit right away.
+        // Sprinting hits can never be critical, so sprint is switched off first. No reaction delay: the window is short.
+        if (FALL_CRIT.on() && ready && reach <= ATTACK_RANGE.value
+                && !bot.onGround() && bot.getDeltaMovement().y < 0.0) {
+            run(server, "player " + name + " unsprint");
+            run(server, "player " + name + " attack once");
+            f.attackTick = globalTick;
+            f.reactAt = -1;
+            f.sprintHoldUntil = globalTick + 3;
+            return;
+        }
+
+        boolean critPossible = CRIT_CHANCE.value > 0 && dist <= CRIT_RANGE.value;
+        if (ready && (reach <= ATTACK_RANGE.value || critPossible)) {
+            // Reaction time: wait a random number of ticks between the minimum and maximum before acting.
+            if (f.reactAt < 0) {
+                int lo = Math.min(REACT_MIN.asInt(), REACT_MAX.asInt());
+                int hi = Math.max(REACT_MIN.asInt(), REACT_MAX.asInt());
+                f.reactAt = globalTick + lo + ThreadLocalRandom.current().nextInt(hi - lo + 1);
             }
+            if (globalTick >= f.reactAt) {
+                f.reactAt = -1;
+                boolean tryCrit = critPossible && bot.onGround() && !f.hopping
+                        && ThreadLocalRandom.current().nextDouble() * 100.0 < CRIT_CHANCE.value;
+                if (tryCrit) {
+                    // Crits need a falling, non-sprinting hit: stop sprinting and jump.
+                    run(server, "player " + name + " unsprint");
+                    run(server, "player " + name + " jump once");
+                    f.crit = true;
+                    f.critStart = globalTick;
+                } else if (reach <= ATTACK_RANGE.value) {
+                    run(server, "player " + name + " attack once");
+                    f.attackTick = globalTick;
+                }
+            }
+        } else {
+            f.reactAt = -1;
         }
     }
 
@@ -931,6 +1099,7 @@ public class PvpBotMod implements ModInitializer {
         run(server, "player " + name + " jump continuous");
         f.phase = Phase.FLEE;
         f.phaseStart = globalTick;
+        f.strafeDir = 0;
         f.started = false;
         f.hopping = true;
         f.paused = false;
@@ -964,29 +1133,36 @@ public class PvpBotMod implements ModInitializer {
             endRetreat(server, name, f);
             return;
         }
+        ItemStack food = bot.getInventory().getItem(slot);
+        f.eatSlot = slot;
+        f.eatItem = food.getItem();
+        f.eatStackCount = food.getCount();
+
         run(server, "player " + name + " hotbar " + (slot + 1));
-        run(server, "player " + name + " use once");
+        // Look straight up so the right-click can't hit a door, chest or button instead of the food.
+        run(server, "player " + name + " look " + String.format(Locale.ROOT, "%.1f", bot.getYRot()) + " -90");
+        // Eating only continues while "use" is held, so it must be continuous ("use once" cancels after one tick).
+        run(server, "player " + name + " use continuous");
         f.phase = Phase.EAT;
         f.useStart = globalTick;
     }
 
     private static void eatPhase(MinecraftServer server, String name, Fight f,
                                  ServerPlayer bot, ServerPlayer target, double dist) {
-        if (globalTick % 2 == 0) {
-            run(server, "player " + name + " look upon " + f.target + " eyes");
-        }
         int elapsed = globalTick - f.useStart;
-        if (elapsed < 5 || (bot.isUsingItem() && elapsed <= EAT_TIMEOUT_TICKS)) {
+        ItemStack now = bot.getInventory().getItem(f.eatSlot);
+        boolean consumed = now.isEmpty() || !now.is(f.eatItem) || now.getCount() < f.eatStackCount;
+        boolean gaveUp = elapsed > EAT_TIMEOUT_TICKS || (elapsed >= 5 && !bot.isUsingItem());
+        if (!consumed && !gaveUp) {
             return; // still eating
         }
 
+        run(server, "player " + name + " use"); // let go of right-click so it doesn't start on its own
         f.eaten++;
         if (f.eaten >= EAT_COUNT.asInt() || findFoodIndex(bot) < 0) {
             endRetreat(server, name, f); // done: fight again
-        } else if (dist < FLEE_DIST.value * 0.6) {
-            startFlee(server, name, f); // the target caught up: run again before the next bite
         } else {
-            startEat(server, name, f, bot);
+            startEat(server, name, f, bot); // keep eating, even if the target is right on top of the bot
         }
     }
 

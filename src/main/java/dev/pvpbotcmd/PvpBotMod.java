@@ -20,6 +20,9 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.ItemTags;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
@@ -40,7 +43,14 @@ import java.util.TreeSet;
  * Adds /pvpbot. Everything is done by running HeroBot's own commands
  * (/playerspawn and /player), so this mod has no compile-time dependency on HeroBot.
  *
- *   /pvpbot spawn <name>              spawn a survival bot with a diamond kit at your position
+ *   /pvpbot spawn <name>              spawn a survival bot at your position (no items)
+ *
+ * Bots made with /pvpbot spawn or /pvpbot adopt also:
+ *   - wear any armor that is in their inventory (empty armor slots only)
+ *   - hold their best sword (or axe) from the hotbar while fighting
+ *   - eat food from anywhere in their inventory when hungry (see /pvpbot eat)
+ *
+ *   /pvpbot adopt <name>              take control of a bot you spawned with /playerspawn
  *   /pvpbot fight <name> [target]     bot chases and attacks target (default: you)
  *   /pvpbot stop <name>               bot stops fighting
  *   /pvpbot ping <name> <ms>          set the bot's simulated ping
@@ -56,8 +66,10 @@ public class PvpBotMod implements ModInitializer {
 
     private static final Set<String> BOTS = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
     private static final Map<String, Fight> FIGHTS = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+    private static final Map<String, Pending> PENDING = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
     private static CommandDispatcher<CommandSourceStack> dispatcher;
     private static int tickCounter = 0;
+    private static int globalTick = 0;
 
     private static final double MIN_RANGE = 1.0;
     private static final double MAX_RANGE = 6.0;
@@ -71,6 +83,16 @@ public class PvpBotMod implements ModInitializer {
     private static final SuggestionProvider<CommandSourceStack> BOT_NAMES =
             (ctx, builder) -> SharedSuggestionProvider.suggest(BOTS, builder);
 
+    /** A bot that was asked to spawn but has not joined yet (HeroBot spawns bots asynchronously). */
+    private static final class Pending {
+        final String owner;
+        int waited;
+
+        Pending(String owner) {
+            this.owner = owner;
+        }
+    }
+
     private static final class Fight {
         final String target;
         ServerPlayer lastBot;
@@ -78,6 +100,7 @@ public class PvpBotMod implements ModInitializer {
         boolean hopping;
         boolean eating;
         int eatStartTick;
+        int weaponSlot = -1;
 
         Fight(String target) {
             this.target = target;
@@ -95,6 +118,7 @@ public class PvpBotMod implements ModInitializer {
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
             BOTS.clear();
             FIGHTS.clear();
+            PENDING.clear();
         });
     }
 
@@ -105,6 +129,9 @@ public class PvpBotMod implements ModInitializer {
                 .then(Commands.literal("spawn")
                         .then(Commands.argument("name", StringArgumentType.word())
                                 .executes(ctx -> spawn(ctx, StringArgumentType.getString(ctx, "name")))))
+                .then(Commands.literal("adopt")
+                        .then(Commands.argument("name", StringArgumentType.word())
+                                .executes(ctx -> adopt(ctx, StringArgumentType.getString(ctx, "name")))))
                 .then(Commands.literal("fight")
                         .then(Commands.argument("name", StringArgumentType.word())
                                 .suggests(BOT_NAMES)
@@ -191,26 +218,41 @@ public class PvpBotMod implements ModInitializer {
             return 0;
         }
 
-        String pos = String.format(Locale.ROOT, "%.2f %.2f %.2f", me.getX(), me.getY(), me.getZ());
-        // Uses the caller's own permissions, so HeroBot's permission rules still apply.
-        server.getCommands().performPrefixedCommand(src.withSuppressedOutput(),
-                "playerspawn " + name + " at " + pos + " in survival");
-
-        if (server.getPlayerList().getPlayerByName(name) == null) {
-            src.sendFailure(Component.literal("Could not spawn " + name + ". Check that you have permission to use /playerspawn."));
+        if (PENDING.containsKey(name)) {
+            src.sendFailure(Component.literal(name + " is already being spawned."));
             return 0;
         }
 
+        String pos = String.format(Locale.ROOT, "%.2f %.2f %.2f", me.getX(), me.getY(), me.getZ());
+        // Runs with the caller's own permissions and shows HeroBot's own messages, so any error is visible.
+        server.getCommands().performPrefixedCommand(src,
+                "playerspawn " + name + " at " + pos + " in survival");
+
+        // HeroBot spawns bots asynchronously, so the bot may not exist yet. tickPending() finishes the job.
+        PENDING.put(name, new Pending(me.getName().getString()));
+        return 1;
+    }
+
+    private static int adopt(CommandContext<CommandSourceStack> ctx, String name) throws CommandSyntaxException {
+        CommandSourceStack src = ctx.getSource();
+        ServerPlayer me = src.getPlayerOrException();
+        if (src.getServer().getPlayerList().getPlayerByName(name) == null) {
+            src.sendFailure(Component.literal("No player named " + name + " is online."));
+            return 0;
+        }
+        if (name.equalsIgnoreCase(me.getName().getString())) {
+            src.sendFailure(Component.literal("You can't adopt yourself."));
+            return 0;
+        }
         BOTS.add(name);
-        giveKit(server, name);
-        src.sendSuccess(() -> Component.literal("Spawned " + name + ". Use /pvpbot fight " + name + " to start."), false);
+        src.sendSuccess(() -> Component.literal("Now controlling " + name + ". Use /pvpbot fight " + name + " to start."), false);
         return 1;
     }
 
     private static int fight(CommandContext<CommandSourceStack> ctx, String name, String target) throws CommandSyntaxException {
         CommandSourceStack src = ctx.getSource();
         if (!BOTS.contains(name)) {
-            src.sendFailure(Component.literal(name + " is not a bot made with /pvpbot spawn."));
+            src.sendFailure(Component.literal(name + " is not a PvP bot yet. If you spawned it with /playerspawn, run /pvpbot adopt " + name + " first."));
             return 0;
         }
         String t = target != null ? target : src.getPlayerOrException().getName().getString();
@@ -226,7 +268,7 @@ public class PvpBotMod implements ModInitializer {
     private static int stop(CommandContext<CommandSourceStack> ctx, String name) {
         CommandSourceStack src = ctx.getSource();
         if (!BOTS.contains(name)) {
-            src.sendFailure(Component.literal(name + " is not a bot made with /pvpbot spawn."));
+            src.sendFailure(Component.literal(name + " is not a PvP bot yet. If you spawned it with /playerspawn, run /pvpbot adopt " + name + " first."));
             return 0;
         }
         FIGHTS.remove(name);
@@ -238,7 +280,7 @@ public class PvpBotMod implements ModInitializer {
     private static int ping(CommandContext<CommandSourceStack> ctx, String name, int ms) {
         CommandSourceStack src = ctx.getSource();
         if (!BOTS.contains(name)) {
-            src.sendFailure(Component.literal(name + " is not a bot made with /pvpbot spawn."));
+            src.sendFailure(Component.literal(name + " is not a PvP bot yet. If you spawned it with /playerspawn, run /pvpbot adopt " + name + " first."));
             return 0;
         }
         run(src.getServer(), "player " + name + " ping " + ms);
@@ -279,7 +321,7 @@ public class PvpBotMod implements ModInitializer {
     private static int remove(CommandContext<CommandSourceStack> ctx, String name) {
         CommandSourceStack src = ctx.getSource();
         if (!BOTS.contains(name)) {
-            src.sendFailure(Component.literal(name + " is not a bot made with /pvpbot spawn."));
+            src.sendFailure(Component.literal(name + " is not a PvP bot yet. If you spawned it with /playerspawn, run /pvpbot adopt " + name + " first."));
             return 0;
         }
         removeBot(src.getServer(), name);
@@ -358,23 +400,12 @@ public class PvpBotMod implements ModInitializer {
                 server.createCommandSourceStack().withSuppressedOutput(), command);
     }
 
-    private static void giveKit(MinecraftServer server, String n) {
-        run(server, "item replace entity " + n + " hotbar.0 with minecraft:diamond_sword");
-        run(server, "item replace entity " + n + " hotbar.1 with minecraft:golden_apple 16");
-        run(server, "item replace entity " + n + " hotbar.2 with minecraft:cooked_beef 32");
-        run(server, "item replace entity " + n + " armor.head with minecraft:diamond_helmet");
-        run(server, "item replace entity " + n + " armor.chest with minecraft:diamond_chestplate");
-        run(server, "item replace entity " + n + " armor.legs with minecraft:diamond_leggings");
-        run(server, "item replace entity " + n + " armor.feet with minecraft:diamond_boots");
-        run(server, "item replace entity " + n + " weapon.offhand with minecraft:shield");
-        run(server, "player " + n + " hotbar 1");
-    }
-
-    /** Hotbar index (0-8) of the best food: golden apples first, then anything edible. -1 if none. */
-    private static int findFoodSlot(ServerPlayer bot) {
+    /** Inventory index (0-35) of the best food: golden apples first, then anything edible. -1 if none. */
+    private static int findFoodIndex(ServerPlayer bot) {
+        Inventory inv = bot.getInventory();
         int any = -1;
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = bot.getInventory().getItem(i);
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inv.getItem(i);
             if (stack.isEmpty() || !stack.has(DataComponents.FOOD)) {
                 continue;
             }
@@ -388,9 +419,154 @@ public class PvpBotMod implements ModInitializer {
         return any;
     }
 
+    private static int weaponScore(ItemStack stack) {
+        if (stack.isEmpty()) {
+            return 0;
+        }
+        if (stack.is(Items.NETHERITE_SWORD)) {
+            return 7;
+        }
+        if (stack.is(Items.DIAMOND_SWORD)) {
+            return 6;
+        }
+        if (stack.is(Items.IRON_SWORD)) {
+            return 5;
+        }
+        if (stack.is(Items.STONE_SWORD)) {
+            return 4;
+        }
+        if (stack.is(ItemTags.SWORDS)) {
+            return 3;
+        }
+        if (stack.is(ItemTags.AXES)) {
+            return 2;
+        }
+        return 0;
+    }
+
+    /** Hotbar index (0-8) of the best weapon (best sword, else an axe). -1 if none. */
+    private static int findWeaponSlot(ServerPlayer bot) {
+        Inventory inv = bot.getInventory();
+        int best = -1;
+        int bestScore = 0;
+        for (int i = 0; i < 9; i++) {
+            int score = weaponScore(inv.getItem(i));
+            if (score > bestScore) {
+                bestScore = score;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /** Makes sure the item at inventory index idx is in the hotbar, and returns its hotbar index (-1 if impossible). */
+    private static int toHotbar(ServerPlayer bot, int idx, int avoidSlot) {
+        if (idx < 9) {
+            return idx;
+        }
+        Inventory inv = bot.getInventory();
+        int target = -1;
+        for (int i = 0; i < 9; i++) {
+            if (i != avoidSlot && inv.getItem(i).isEmpty()) {
+                target = i;
+                break;
+            }
+        }
+        if (target < 0) {
+            for (int i = 0; i < 9; i++) {
+                if (i != avoidSlot) {
+                    target = i;
+                    break;
+                }
+            }
+        }
+        if (target < 0) {
+            return -1;
+        }
+        ItemStack moving = inv.getItem(idx);
+        ItemStack displaced = inv.getItem(target);
+        inv.setItem(idx, displaced);
+        inv.setItem(target, moving);
+        return target;
+    }
+
+    private static EquipmentSlot armorSlotFor(ItemStack stack) {
+        if (stack.is(ItemTags.HEAD_ARMOR)) {
+            return EquipmentSlot.HEAD;
+        }
+        if (stack.is(ItemTags.CHEST_ARMOR)) {
+            return EquipmentSlot.CHEST;
+        }
+        if (stack.is(ItemTags.LEG_ARMOR)) {
+            return EquipmentSlot.LEGS;
+        }
+        if (stack.is(ItemTags.FOOT_ARMOR)) {
+            return EquipmentSlot.FEET;
+        }
+        return null;
+    }
+
+    /** Puts armor from the bot's inventory into any empty armor slot. */
+    private static void equipArmor(ServerPlayer bot) {
+        Inventory inv = bot.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            EquipmentSlot slot = armorSlotFor(stack);
+            if (slot == null || !bot.getItemBySlot(slot).isEmpty()) {
+                continue;
+            }
+            bot.setItemSlot(slot, stack.copy());
+            inv.setItem(i, ItemStack.EMPTY);
+        }
+    }
+
+    private static void tickArmor(MinecraftServer server) {
+        for (String name : BOTS) {
+            ServerPlayer bot = server.getPlayerList().getPlayerByName(name);
+            if (bot != null) {
+                equipArmor(bot);
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- fight loop
 
+    private static void tickPending(MinecraftServer server) {
+        Iterator<Map.Entry<String, Pending>> it = PENDING.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Pending> e = it.next();
+            String name = e.getKey();
+            Pending p = e.getValue();
+            ServerPlayer owner = server.getPlayerList().getPlayerByName(p.owner);
+
+            if (server.getPlayerList().getPlayerByName(name) != null) {
+                it.remove();
+                BOTS.add(name);
+                if (owner != null) {
+                    owner.sendSystemMessage(Component.literal(
+                            "Spawned " + name + ". Use /pvpbot fight " + name + " to start."));
+                }
+            } else if (++p.waited > 200) {
+                it.remove();
+                if (owner != null) {
+                    owner.sendSystemMessage(Component.literal(
+                            "Could not spawn " + name + " (timed out). Check HeroBot's message above."));
+                }
+            }
+        }
+    }
+
     private static void tick(MinecraftServer server) {
+        globalTick++;
+        if (!PENDING.isEmpty()) {
+            tickPending(server);
+        }
+        if (globalTick % 10 == 0 && !BOTS.isEmpty()) {
+            tickArmor(server);
+        }
         if (FIGHTS.isEmpty()) {
             return;
         }
@@ -415,6 +591,7 @@ public class PvpBotMod implements ModInitializer {
                 f.started = false;
                 f.hopping = false;
                 f.eating = false;
+                f.weaponSlot = -1;
             }
 
             ServerPlayer target = server.getPlayerList().getPlayerByName(f.target);
@@ -429,7 +606,6 @@ public class PvpBotMod implements ModInitializer {
             }
 
             if (!f.started) {
-                run(server, "player " + botName + " hotbar 1");
                 run(server, "player " + botName + " autojump true");
                 run(server, "player " + botName + " sprint");
                 run(server, "player " + botName + " move forward");
@@ -440,20 +616,23 @@ public class PvpBotMod implements ModInitializer {
                 run(server, "player " + botName + " look upon " + f.target + " eyes");
             }
 
-            // Auto-eat: swap to food, eat, then swap back to the sword in hotbar slot 1.
+            // Auto-eat: pick food from anywhere in the inventory, hold it, eat, then go back to the weapon.
             if (f.eating) {
                 int elapsed = tickCounter - f.eatStartTick;
                 if ((elapsed >= 5 && !bot.isUsingItem()) || elapsed > 100) {
-                    run(server, "player " + botName + " hotbar 1");
                     f.eating = false;
+                    f.weaponSlot = -1; // forces a switch back to the sword below
                 }
             } else if (eatBelow > 0 && bot.getFoodData().getFoodLevel() <= eatBelow) {
-                int slot = findFoodSlot(bot);
-                if (slot >= 0) {
-                    run(server, "player " + botName + " hotbar " + (slot + 1));
-                    run(server, "player " + botName + " use once");
-                    f.eating = true;
-                    f.eatStartTick = tickCounter;
+                int idx = findFoodIndex(bot);
+                if (idx >= 0) {
+                    int slot = toHotbar(bot, idx, findWeaponSlot(bot));
+                    if (slot >= 0) {
+                        run(server, "player " + botName + " hotbar " + (slot + 1));
+                        run(server, "player " + botName + " use once");
+                        f.eating = true;
+                        f.eatStartTick = tickCounter;
+                    }
                 }
             }
             if (f.eating) {
@@ -462,6 +641,15 @@ public class PvpBotMod implements ModInitializer {
                     f.hopping = false;
                 }
                 continue; // no hopping or attacking while eating
+            }
+
+            // Hold the best weapon in the hotbar (re-checked every half second, or right after eating).
+            if (f.weaponSlot < 0 || tickCounter % 10 == 0) {
+                int w = findWeaponSlot(bot);
+                if (w >= 0 && w != f.weaponSlot) {
+                    run(server, "player " + botName + " hotbar " + (w + 1));
+                    f.weaponSlot = w;
+                }
             }
 
             double dist = bot.distanceTo(target);

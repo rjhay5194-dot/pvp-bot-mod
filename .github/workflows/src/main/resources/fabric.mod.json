@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "pvpbotcmd",
+  "version": "${version}",
+  "name": "PvPBot Commands",
+  "description": "Adds /pvpbot: spawn and control PvP bots using HeroBot's /playerspawn and /player commands.",
+  "authors": ["You"],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["dev.pvpbotcmd.PvpBotMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.1",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

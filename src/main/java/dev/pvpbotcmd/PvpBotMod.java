@@ -208,12 +208,12 @@ public class PvpBotMod implements ModInitializer {
             "percent chance to jump right after taking a hit, to shake off the knockback");
     private static final Opt SHIELD_CHANCE = opt("shield", "shield_chance", 45, 0, 100, false,
             "percent chance to raise a shield when the target is about to swing (needs a shield in the inventory)");
-    private static final Opt SHIELD_TICKS = opt("shieldticks", "shield_ticks", 8, 2, 40, false,
-            "ticks the shield stays up");
+    private static final Opt SHIELD_TICKS = opt("shieldticks", "shield_ticks", 20, 2, 100, false,
+            "ticks the shield stays up (a shield needs about 5 ticks to start blocking, so keep this well above that)");
     private static final Opt STUN_CHANCE = opt("stun", "shield_stun_chance", 35, 0, 100, false,
             "percent chance to swap to an axe when the target raises a shield, to disable it");
     private static final Opt HIT_WEB = opt("hitweb", "hit_web_chance", 25, 0, 100, false,
-            "percent chance that a landed hit drops a cobweb on the target (uses a cobweb from the bot's inventory)");
+            "percent chance that a landed hit is followed by really placing a cobweb at the target's feet (needs cobwebs in the inventory)");
     private static final Opt WEB_LIFETIME = opt("webtime", "web_lifetime_ticks", 100, 0, 1200, false,
             "ticks before a cobweb dropped by a bot disappears again (0 = never)");
     private static final Opt STUCK = opt("stuck", "stuck_detection", 1, 0, 1, true,
@@ -332,6 +332,10 @@ public class PvpBotMod implements ModInitializer {
         boolean blocking;
         int blockUntil;
         boolean shieldRolled;
+        int placeStage;
+        int placeStart;
+        int placeCooldown;
+        BlockPos placeCell;
         int strafeDir;
         int nextStrafeTick;
         int webStage;
@@ -360,6 +364,7 @@ public class PvpBotMod implements ModInitializer {
             targetBlocking = false;
             blocking = false;
             shieldRolled = false;
+            placeStage = 0;
             lastHp = -1;
             lastPos = null;
         }
@@ -1031,25 +1036,95 @@ public class PvpBotMod implements ModInitializer {
         return -1;
     }
 
-    /** Hit web: sometimes put one of the bot's cobwebs on the block the target is standing in. */
-    private static void tryHitWeb(ServerPlayer bot, ServerPlayer target) {
-        if (HIT_WEB.value <= 0 || ThreadLocalRandom.current().nextDouble() * 100.0 >= HIT_WEB.value) {
+    private static String fmt(double v) {
+        return String.format(Locale.ROOT, "%.2f", v);
+    }
+
+    /**
+     * Hit web, step 1: after one of our hits lands, sometimes take out a cobweb (real placement, in a few ticks):
+     * swap to it, aim at the floor at the target's feet, right-click, swap back.
+     */
+    private static void startWebPlace(MinecraftServer server, String name, Fight f, ServerPlayer bot, ServerPlayer target) {
+        if (f.placeStage != 0 || globalTick < f.placeCooldown || HIT_WEB.value <= 0
+                || ThreadLocalRandom.current().nextDouble() * 100.0 >= HIT_WEB.value) {
             return;
         }
         int idx = findItemIndex(bot, Items.COBWEB);
-        if (idx < 0) {
+        if (idx < 0 || webAimPoint(bot, target, f) == null) {
             return;
+        }
+        int slot = toHotbar(bot, idx, findWeaponSlot(bot));
+        if (slot < 0) {
+            return;
+        }
+        run(server, "player " + name + " move"); // hold still while placing
+        run(server, "player " + name + " hotbar " + (slot + 1));
+        f.strafeDir = 0;
+        f.placeStage = 1;
+        f.placeStart = globalTick;
+    }
+
+    /** A point on the floor just in front of the target's feet (the near side of the block it stands in). */
+    private static Vec3 webAimPoint(ServerPlayer bot, ServerPlayer target, Fight f) {
+        if (!target.onGround()) {
+            return null;
         }
         Level level = target.level();
-        BlockPos pos = target.blockPosition();
-        if (!level.getBlockState(pos).isAir() || pos.equals(bot.blockPosition())) {
-            return;
+        int floorY = target.blockPosition().getY();
+        double dx = bot.getX() - target.getX();
+        double dz = bot.getZ() - target.getZ();
+        double len = Math.sqrt(dx * dx + dz * dz);
+        if (len < 0.05) {
+            return null;
         }
-        bot.getInventory().getItem(idx).shrink(1);
-        level.setBlock(pos, Blocks.COBWEB.defaultBlockState(), 3);
-        if (WEB_LIFETIME.asInt() > 0) {
-            PLACED_WEBS.add(new PlacedWeb(level, pos, globalTick + WEB_LIFETIME.asInt()));
+        double px = target.getX() + dx / len * 0.45;
+        double pz = target.getZ() + dz / len * 0.45;
+        BlockPos cell = BlockPos.containing(px, floorY, pz);
+        if (!level.getBlockState(cell).isAir() || level.getBlockState(cell.below()).isAir()) {
+            return null;
         }
+        f.placeCell = cell;
+        return new Vec3(px, floorY, pz);
+    }
+
+    /** Hit web, steps 2-4. Returns true while busy (the rest of the fight logic waits). */
+    private static boolean webPlaceStep(MinecraftServer server, String name, Fight f, ServerPlayer bot, ServerPlayer target) {
+        if (f.placeStage == 0) {
+            return false;
+        }
+        int elapsed = globalTick - f.placeStart;
+        if (f.placeStage == 1) {
+            if (elapsed >= 1) {
+                Vec3 aim = webAimPoint(bot, target, f); // aim again: the target moved after the hit
+                if (aim == null) {
+                    endWebPlace(server, name, f);
+                    return false;
+                }
+                run(server, "player " + name + " look at " + fmt(aim.x) + " " + fmt(aim.y) + " " + fmt(aim.z));
+                f.placeStage = 2;
+            }
+        } else if (f.placeStage == 2) {
+            if (elapsed >= 2) {
+                run(server, "player " + name + " use once"); // place the cobweb
+                f.placeStage = 3;
+            }
+        } else if (elapsed >= 4) {
+            if (f.placeCell != null && bot.level().getBlockState(f.placeCell).is(Blocks.COBWEB)
+                    && WEB_LIFETIME.asInt() > 0) {
+                PLACED_WEBS.add(new PlacedWeb(bot.level(), f.placeCell, globalTick + WEB_LIFETIME.asInt()));
+            }
+            endWebPlace(server, name, f);
+            return false;
+        }
+        return true;
+    }
+
+    private static void endWebPlace(MinecraftServer server, String name, Fight f) {
+        f.placeStage = 0;
+        f.placeCooldown = globalTick + 30;
+        f.weaponSlot = -1; // back to the sword
+        run(server, "player " + name + " move forward");
+        run(server, "player " + name + " sprint");
     }
 
     private static String lookCmd(String name, String target) {
@@ -1069,10 +1144,21 @@ public class PvpBotMod implements ModInitializer {
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
 
+    /** A cobweb touching any part of the bot's hitbox (this also catches webs the bot is only standing at the edge of). */
+    private static BlockPos findCobweb(ServerPlayer bot) {
+        AABB box = bot.getBoundingBox();
+        BlockPos min = BlockPos.containing(box.minX + 1.0E-7, box.minY + 1.0E-7, box.minZ + 1.0E-7);
+        BlockPos max = BlockPos.containing(box.maxX - 1.0E-7, box.maxY - 1.0E-7, box.maxZ - 1.0E-7);
+        for (BlockPos p : BlockPos.betweenClosed(min, max)) {
+            if (bot.level().getBlockState(p).is(Blocks.COBWEB)) {
+                return p.immutable();
+            }
+        }
+        return null;
+    }
+
     private static boolean inCobweb(ServerPlayer bot) {
-        BlockPos pos = bot.blockPosition();
-        return bot.level().getBlockState(pos).is(Blocks.COBWEB)
-                || bot.level().getBlockState(pos.above()).is(Blocks.COBWEB);
+        return findCobweb(bot) != null;
     }
 
     private static int findItemIndex(ServerPlayer bot, Item item) {
@@ -1086,13 +1172,18 @@ public class PvpBotMod implements ModInitializer {
     }
 
     /**
-     * Cobweb escape. With a water bucket: look down, pour so the water breaks the web, scoop the water straight
-     * back up, and clean up by hand if the scoop missed. Without one: mine the web with the best weapon.
+     * Cobweb escape, checked every tick in every phase so a bot reacts the moment a web touches it.
+     * With a water bucket: aim at the web, pour so the water breaks it, scoop the water straight back up
+     * (and clean up by hand if the scoop missed). Without one: mine the web with the best weapon.
      * Returns true while it is busy (the rest of the fight logic waits).
      */
     private static boolean webEscape(MinecraftServer server, String name, Fight f, ServerPlayer bot) {
         if (f.webStage == 0) {
-            if ((!WEB_ESCAPE.on() && !WEB_BREAK.on()) || globalTick < f.nextWebTick || !inCobweb(bot)) {
+            if ((!WEB_ESCAPE.on() && !WEB_BREAK.on()) || globalTick < f.nextWebTick) {
+                return false;
+            }
+            BlockPos web = findCobweb(bot);
+            if (web == null) {
                 return false;
             }
             int idx = WEB_ESCAPE.on() ? findItemIndex(bot, Items.WATER_BUCKET) : -1;
@@ -1101,29 +1192,36 @@ public class PvpBotMod implements ModInitializer {
                 f.nextWebTick = globalTick + 100; // no water bucket: don't check every tick
                 return false;
             }
-            String down = "player " + name + " look " + String.format(Locale.ROOT, "%.1f", bot.getYRot()) + " 90";
+            String aim = "player " + name + " look at " + fmt(web.getX() + 0.5) + " "
+                    + fmt(web.getY() + 0.5) + " " + fmt(web.getZ() + 0.5);
             run(server, "player " + name + " stop");
             if (slot >= 0) {
                 run(server, "player " + name + " hotbar " + (slot + 1));
-                run(server, down);
+                run(server, aim);
                 f.webSlot = slot;
-                f.webPos = bot.blockPosition();
                 f.webStage = 1;
             } else {
                 int w = findWeaponSlot(bot);
                 if (w >= 0) {
                     run(server, "player " + name + " hotbar " + (w + 1));
                 }
-                run(server, down);
+                run(server, aim);
                 run(server, "player " + name + " attack continuous"); // mine the web
                 f.webStage = 10;
             }
+            f.webPos = web;
             f.webStart = globalTick;
+            // Whatever the bot was doing (fighting, running away, eating), it is stuck: drop it and get out first.
+            f.phase = Phase.FIGHT;
+            f.eaten = 0;
+            f.nextEatTick = Math.max(f.nextEatTick, globalTick + 40);
             f.started = false;
             f.hopping = false;
             f.paused = false;
             f.crit = false;
             f.blocking = false;
+            f.axeMode = false;
+            f.placeStage = 0;
             f.strafeDir = 0;
             f.attackTick = -1;
             return true;
@@ -1146,13 +1244,13 @@ public class PvpBotMod implements ModInitializer {
         } else if (f.webStage == 3) {
             if (globalTick - f.webStart >= 3) {
                 cleanupWater(bot, f);
-                finishWeb(f, 20);
+                finishWeb(f, 4);
             }
         } else if (f.webStage == 10) {
             boolean timedOut = globalTick - f.webStart > WEB_BREAK_TIMEOUT_TICKS;
             if (!inCobweb(bot) || timedOut) {
                 run(server, "player " + name + " stop"); // stops mining
-                finishWeb(f, timedOut ? 60 : 20);
+                finishWeb(f, timedOut ? 60 : 4);
             }
         }
         return true;
@@ -1165,7 +1263,7 @@ public class PvpBotMod implements ModInitializer {
         f.weaponSlot = -1; // back to the sword
     }
 
-    /** If the scoop missed, remove any water source we poured and put the water back in the bucket. */
+    /** If the scoop missed, remove any water source we poured near the web and put the water back in the bucket. */
     private static void cleanupWater(ServerPlayer bot, Fight f) {
         if (f.webPos == null || f.webSlot < 0 || f.webSlot >= 36) {
             return;
@@ -1175,12 +1273,16 @@ public class PvpBotMod implements ModInitializer {
             return; // the bucket is full again: the scoop worked (or nothing was poured)
         }
         boolean removed = false;
-        for (int dy = -1; dy <= 2; dy++) {
-            BlockPos p = f.webPos.above(dy);
-            FluidState fluid = bot.level().getFluidState(p);
-            if (fluid.is(FluidTags.WATER) && fluid.isSource()) {
-                bot.level().setBlock(p, Blocks.AIR.defaultBlockState(), 3);
-                removed = true;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dy = -1; dy <= 2; dy++) {
+                    BlockPos p = f.webPos.offset(dx, dy, dz);
+                    FluidState fluid = bot.level().getFluidState(p);
+                    if (fluid.is(FluidTags.WATER) && fluid.isSource()) {
+                        bot.level().setBlock(p, Blocks.AIR.defaultBlockState(), 3);
+                        removed = true;
+                    }
+                }
             }
         }
         if (removed) {
@@ -1401,6 +1503,11 @@ public class PvpBotMod implements ModInitializer {
                 continue;
             }
 
+            // Stuck in a cobweb? Get out first, whatever the bot was doing.
+            if (webEscape(server, name, f, bot)) {
+                continue;
+            }
+
             double dist = bot.distanceTo(target);
             switch (f.phase) {
                 case FIGHT -> fightPhase(server, name, f, bot, target, dist);
@@ -1412,11 +1519,6 @@ public class PvpBotMod implements ModInitializer {
 
     private static void fightPhase(MinecraftServer server, String name, Fight f,
                                    ServerPlayer bot, ServerPlayer target, double dist) {
-        // Stuck in a cobweb: use a water bucket to get out.
-        if (webEscape(server, name, f, bot)) {
-            return;
-        }
-
         // Jump reset: right after taking a hit, sometimes jump to shake off the knockback.
         double hpNow = bot.getHealth() + bot.getAbsorptionAmount();
         if (f.lastHp >= 0 && hpNow < f.lastHp - 0.01 && JUMP_RESET.value > 0 && bot.onGround()
@@ -1430,6 +1532,11 @@ public class PvpBotMod implements ModInitializer {
         if (EAT_HEARTS.value > 0 && hp <= EAT_HEARTS.value * 2.0 && globalTick >= f.nextEatTick
                 && findFoodIndex(bot) >= 0) {
             startFlee(server, name, f);
+            return;
+        }
+
+        // Placing a cobweb on the target (started after a landed hit): the rest waits.
+        if (webPlaceStep(server, name, f, bot, target)) {
             return;
         }
 
@@ -1569,7 +1676,7 @@ public class PvpBotMod implements ModInitializer {
         int hitStamp = target.getLastHurtByMobTimestamp();
         if (lastHitter == bot && hitStamp != f.lastHitStamp) {
             f.lastHitStamp = hitStamp;
-            tryHitWeb(bot, target);
+            startWebPlace(server, name, f, bot, target);
         }
 
         // Shield: while our own swing is recharging and the target is about to swing, sometimes block.
@@ -1584,7 +1691,7 @@ public class PvpBotMod implements ModInitializer {
             } else {
                 return; // stay behind the shield: no attacking
             }
-        } else if (SHIELD_CHANCE.value > 0 && targetReady && !f.shieldRolled && !ready && dist <= 4.5
+        } else if (SHIELD_CHANCE.value > 0 && targetReady && !f.shieldRolled && !ready && dist <= 6.0
                 && bot.getItemBySlot(EquipmentSlot.OFFHAND).is(Items.SHIELD)) {
             f.shieldRolled = true;
             if (ThreadLocalRandom.current().nextDouble() * 100.0 < SHIELD_CHANCE.value) {
@@ -1593,6 +1700,19 @@ public class PvpBotMod implements ModInitializer {
                 f.blockUntil = globalTick + Math.max(2, SHIELD_TICKS.asInt());
                 return;
             }
+        }
+
+        // Stun strike: axe in hand and the target is blocking. Hit at once (the charge doesn't matter for
+        // knocking a shield down), then go back to the sword on the very next tick.
+        if (f.axeMode && bot.getMainHandItem().is(ItemTags.AXES)) {
+            if (reach <= ATTACK_RANGE.value) {
+                run(server, "player " + name + " attack once");
+                f.attackTick = globalTick;
+                f.axeMode = false;
+                f.weaponSlot = -1;
+                f.reactAt = -1;
+            }
+            return;
         }
 
         // Critical hit in progress: hit on the way down.
@@ -1658,6 +1778,8 @@ public class PvpBotMod implements ModInitializer {
         run(server, "player " + name + " jump continuous");
         f.phase = Phase.FLEE;
         f.blocking = false;
+        f.axeMode = false;
+        f.placeStage = 0;
         f.phaseStart = globalTick;
         f.strafeDir = 0;
         f.started = false;
@@ -1703,6 +1825,9 @@ public class PvpBotMod implements ModInitializer {
         run(server, "player " + name + " look " + String.format(Locale.ROOT, "%.1f", bot.getYRot()) + " -90");
         // Eating only continues while "use" is held, so it must be continuous ("use once" cancels after one tick).
         run(server, "player " + name + " use continuous");
+        // Keep drifting away while eating: forward (the way it ran, since it looks along that yaw) and hopping.
+        run(server, "player " + name + " move forward");
+        run(server, "player " + name + " jump continuous");
         f.phase = Phase.EAT;
         f.useStart = globalTick;
     }

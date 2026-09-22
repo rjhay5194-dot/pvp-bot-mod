@@ -1102,4 +1102,3 @@ public class PvpBotMod implements ModInitializer {
         }
     }
 }
-
